@@ -14,6 +14,8 @@ use crate::db;
 use crate::error::AppError;
 use crate::models::device::Device;
 
+pub mod send;
+
 pub(crate) const JWT_VALIDATION_LEEWAY_SECS: u64 = 60;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -113,7 +115,7 @@ pub(crate) async fn decode_access_token(env: &Env, token: &str) -> Result<Claims
         .map_err(|_| AppError::Unauthorized("Invalid token".to_string()))?;
     let claims = token.into_parts().1.custom;
 
-    let db = db::get_db(env)?;
+    let db = db::get_db_unconstrained(env)?;
     let current_sstamp = db
         .prepare("SELECT security_stamp FROM users WHERE id = ?1")
         .bind(&[claims.sub.clone().into()])?

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use axum::{
     body::Bytes,
     extract::{Multipart, Path, State},
+    http::HeaderMap,
     Extension, Json,
 };
 use chrono::{TimeZone, Utc};
@@ -10,16 +11,18 @@ use jwt_compact::AlgorithmExt;
 use jwt_compact::{alg::Hs256Key, Claims as JwtClaims, Header};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use worker::{D1Database, Env};
+use worker::Env;
+
+use crate::d1_query;
 
 use crate::{
-    auth::{Claims, JWT_VALIDATION_LEEWAY_SECS},
+    auth::{send::SendAccessClaims, Claims, JWT_VALIDATION_LEEWAY_SECS},
     db,
     error::AppError,
     handlers::attachments::{
         attachments_enabled, delete_storage_objects, is_kv_backend, upload_to_storage,
     },
-    handlers::get_env_usize,
+    handlers::{enforce_ip_rate_limit, get_env_usize},
     models::attachment::display_size,
     models::send::{validate_send_dates, SendDB, SendRequestData, SendType, SEND_INACCESSIBLE_MSG},
     notifications::{self, UpdateType},
@@ -169,6 +172,8 @@ fn build_send(
     deletion_date: String,
     expiration_date: Option<String>,
 ) -> Result<SendDB, AppError> {
+    ensure_email_verification_is_not_requested(payload)?;
+
     let mut send = SendDB::new(
         user_id,
         payload.send_type,
@@ -186,6 +191,16 @@ fn build_send(
     send.disabled = payload.disabled.unwrap_or(false) as i32;
     send.hide_email = payload.hide_email.unwrap_or(false) as i32;
     Ok(send)
+}
+
+fn ensure_email_verification_is_not_requested(payload: &SendRequestData) -> Result<(), AppError> {
+    if matches!(payload.emails.as_deref(), Some(emails) if !emails.is_empty()) {
+        return Err(AppError::BadRequest(
+            "Sends with email verification is not supported".into(),
+        ));
+    }
+
+    Ok(())
 }
 
 /// Apply mutable fields from request to an existing send (for update).
@@ -209,7 +224,7 @@ fn apply_update(
     Ok(())
 }
 
-async fn resolve_creator_identifier(db: &D1Database, send: &SendDB) -> Option<String> {
+async fn resolve_creator_identifier(db: &crate::db::Db, send: &SendDB) -> Option<String> {
     if send.hide_email != 0 {
         return None;
     }
@@ -291,17 +306,17 @@ pub async fn create_text_send(
     send.insert(&db).await?;
     db::touch_user_updated_at(&db, &claims.sub, &send.updated_at).await?;
 
+    let response = send.to_json();
     notifications::publish_send_update(
-        env.as_ref(),
-        &claims.sub,
+        (*env).clone(),
+        claims.sub,
         UpdateType::SyncSendCreate,
-        &send.id,
-        &send.updated_at,
-        Some(&claims.device),
-    )
-    .await;
+        send.id,
+        send.updated_at,
+        Some(claims.device),
+    );
 
-    Ok(Json(send.to_json()))
+    Ok(Json(response))
 }
 
 // ── POST /api/sends/file/v2 (preferred file send creation) ──────────
@@ -403,7 +418,6 @@ pub async fn create_file_send_legacy(
 
     let mut model_json: Option<String> = None;
     let mut file_bytes: Option<Bytes> = None;
-    let mut content_type: Option<String> = None;
 
     while let Some(field) = multipart
         .next_field()
@@ -420,7 +434,6 @@ pub async fn create_file_send_legacy(
                 );
             }
             Some("data") | Some("file") => {
-                content_type = field.content_type().map(|s| s.to_string());
                 file_bytes = Some(
                     field
                         .bytes()
@@ -475,22 +488,22 @@ pub async fn create_file_send_legacy(
     send.set_password(payload.password.as_deref()).await?;
 
     let storage_key = format!("sends/{}/{file_id}", send.id);
-    upload_to_storage(&env, &storage_key, content_type, file_bytes.to_vec()).await?;
+    upload_to_storage(&env, &storage_key, file_bytes.to_vec()).await?;
 
     send.insert(&db).await?;
     db::touch_user_updated_at(&db, &claims.sub, &send.updated_at).await?;
 
+    let response = send.to_json();
     notifications::publish_send_update(
-        env.as_ref(),
-        &claims.sub,
+        (*env).clone(),
+        claims.sub,
         UpdateType::SyncSendCreate,
-        &send.id,
-        &send.updated_at,
-        Some(&claims.device),
-    )
-    .await;
+        send.id,
+        send.updated_at,
+        Some(claims.device),
+    );
 
-    Ok(Json(send.to_json()))
+    Ok(Json(response))
 }
 
 // ── POST /api/sends/{send_id}/file/{file_id} (Direct upload compat) ─
@@ -520,7 +533,6 @@ pub async fn upload_file_send_direct(
     }
 
     let mut file_bytes: Option<Bytes> = None;
-    let mut content_type: Option<String> = None;
 
     while let Some(field) = multipart
         .next_field()
@@ -528,7 +540,6 @@ pub async fn upload_file_send_direct(
         .map_err(|_| AppError::BadRequest("Invalid multipart data".into()))?
     {
         if field.name() == Some("data") || field.name() == Some("file") {
-            content_type = field.content_type().map(|s| s.to_string());
             file_bytes = Some(
                 field
                     .bytes()
@@ -553,20 +564,19 @@ pub async fn upload_file_send_direct(
     }
 
     let storage_key = pending.storage_key().ok_or_else(|| AppError::Internal)?;
-    upload_to_storage(&env, &storage_key, content_type, file_bytes.to_vec()).await?;
+    upload_to_storage(&env, &storage_key, file_bytes.to_vec()).await?;
 
     pending.finalize(&db).await?;
     db::touch_user_updated_at(&db, &claims.sub, &pending.updated_at).await?;
 
     notifications::publish_send_update(
-        env.as_ref(),
-        &claims.sub,
+        (*env).clone(),
+        claims.sub,
         UpdateType::SyncSendCreate,
-        &pending.id,
-        &pending.updated_at,
-        Some(&claims.device),
-    )
-    .await;
+        pending.id,
+        pending.updated_at,
+        Some(claims.device),
+    );
 
     Ok(())
 }
@@ -580,6 +590,8 @@ pub async fn update_send(
     Path(send_id): Path<String>,
     Json(payload): Json<SendRequestData>,
 ) -> Result<Json<Value>, AppError> {
+    ensure_email_verification_is_not_requested(&payload)?;
+
     let (del, exp) =
         validate_send_dates(&payload.deletion_date, payload.expiration_date.as_deref())?;
 
@@ -612,17 +624,17 @@ pub async fn update_send(
     send.update(&db).await?;
     db::touch_user_updated_at(&db, &claims.sub, &send.updated_at).await?;
 
+    let response = send.to_json();
     notifications::publish_send_update(
-        env.as_ref(),
-        &claims.sub,
+        (*env).clone(),
+        claims.sub,
         UpdateType::SyncSendUpdate,
-        &send.id,
-        &send.updated_at,
-        Some(&claims.device),
-    )
-    .await;
+        send.id,
+        send.updated_at,
+        Some(claims.device),
+    );
 
-    Ok(Json(send.to_json()))
+    Ok(Json(response))
 }
 
 // ── DELETE /api/sends/{send_id} ─────────────────────────────────────
@@ -647,14 +659,13 @@ pub async fn delete_send(
     let now = db::now_string();
     db::touch_user_updated_at(&db, &claims.sub, &now).await?;
     notifications::publish_send_update(
-        env.as_ref(),
-        &claims.sub,
+        (*env).clone(),
+        claims.sub,
         UpdateType::SyncSendDelete,
-        &send_id,
-        &now,
-        Some(&claims.device),
-    )
-    .await;
+        send_id,
+        now,
+        Some(claims.device),
+    );
 
     Ok(())
 }
@@ -676,17 +687,17 @@ pub async fn remove_password(
     send.update(&db).await?;
     db::touch_user_updated_at(&db, &claims.sub, &send.updated_at).await?;
 
+    let response = send.to_json();
     notifications::publish_send_update(
-        env.as_ref(),
-        &claims.sub,
+        (*env).clone(),
+        claims.sub,
         UpdateType::SyncSendUpdate,
-        &send.id,
-        &send.updated_at,
-        Some(&claims.device),
-    )
-    .await;
+        send.id,
+        send.updated_at,
+        Some(claims.device),
+    );
 
-    Ok(Json(send.to_json()))
+    Ok(Json(response))
 }
 
 // ── POST /api/sends/access/{access_id} (anonymous access) ──────────
@@ -698,9 +709,91 @@ pub struct SendAccessRequest {
     pub password: Option<String>,
 }
 
+async fn publish_send_access(
+    env: &Arc<Env>,
+    db: &crate::db::Db,
+    send: &SendDB,
+) -> Result<(), AppError> {
+    db::touch_user_updated_at(db, &send.user_id, &send.updated_at).await?;
+    notifications::publish_send_update(
+        (**env).clone(),
+        send.user_id.clone(),
+        UpdateType::SyncSendUpdate,
+        send.id.clone(),
+        send.updated_at.clone(),
+        None,
+    );
+    Ok(())
+}
+
+async fn send_access_response(
+    env: &Arc<Env>,
+    db: &crate::db::Db,
+    send: &SendDB,
+) -> Result<Json<Value>, AppError> {
+    publish_send_access(env, db, send).await?;
+    let creator_id = resolve_creator_identifier(db, send).await;
+    Ok(Json(send.to_access_json(creator_id.as_deref())))
+}
+
+async fn send_file_download_response(
+    env: &Arc<Env>,
+    db: &crate::db::Db,
+    send: &SendDB,
+    file_id: &str,
+    base_url: &str,
+) -> Result<Json<Value>, AppError> {
+    publish_send_access(env, db, send).await?;
+
+    let token = build_download_token(env, &send.id, file_id)?;
+    let url = format!("{base_url}/api/sends/{}/{file_id}?t={token}", send.id);
+
+    Ok(Json(serde_json::json!({
+        "id": file_id,
+        "url": url,
+        "object": "send-fileDownload",
+    })))
+}
+
+async fn find_send_for_access_token(
+    db: &crate::db::Db,
+    claims: &SendAccessClaims,
+) -> Result<SendDB, AppError> {
+    SendDB::find_by_id(db, &claims.sub)
+        .await?
+        .ok_or_else(|| AppError::NotFound(SEND_INACCESSIBLE_MSG.into()))
+}
+
+// ── POST /api/sends/access (Bearer Send access token) ──────────────
+
+#[worker::send]
+pub async fn access_send_with_token(
+    send_access_claims: SendAccessClaims,
+    State(env): State<Arc<Env>>,
+) -> Result<Json<Value>, AppError> {
+    let db = db::get_db(&env)?;
+    let send = find_send_for_access_token(&db, &send_access_claims).await?;
+    send_access_response(&env, &db, &send).await
+}
+
+// ── POST /api/sends/access/file/{file_id} (Bearer Send access token) ─
+
+#[worker::send]
+pub async fn access_file_send_with_token(
+    send_access_claims: SendAccessClaims,
+    State(env): State<Arc<Env>>,
+    Path(file_id): Path<String>,
+    Extension(BaseUrl(base_url)): Extension<BaseUrl>,
+) -> Result<Json<Value>, AppError> {
+    let db = db::get_db(&env)?;
+    let send = find_send_for_access_token(&db, &send_access_claims).await?;
+    send_file_download_response(&env, &db, &send, &file_id, &base_url).await
+}
+
 #[worker::send]
 pub async fn access_send(
     State(env): State<Arc<Env>>,
+    headers: HeaderMap,
     Path(access_id): Path<String>,
     Json(payload): Json<SendAccessRequest>,
 ) -> Result<Json<Value>, AppError> {
@@ -712,6 +805,15 @@ pub async fn access_send(
     send.validate_access()?;
 
     if send.has_password() {
+        enforce_ip_rate_limit(
+            &env,
+            &headers,
+            "SEND_ACCESS_RATE_LIMITER",
+            "send-access",
+            "Too many send password attempts. Please try again later.",
+        )
+        .await?;
+
         let pw = payload
             .password
             .as_deref()
@@ -729,20 +831,7 @@ pub async fn access_send(
         send.update(&db).await?;
     }
 
-    db::touch_user_updated_at(&db, &send.user_id, &send.updated_at).await?;
-
-    notifications::publish_send_update(
-        env.as_ref(),
-        &send.user_id,
-        UpdateType::SyncSendUpdate,
-        &send.id,
-        &send.updated_at,
-        None,
-    )
-    .await;
-
-    let creator_id = resolve_creator_identifier(&db, &send).await;
-    Ok(Json(send.to_access_json(creator_id.as_deref())))
+    send_access_response(&env, &db, &send).await
 }
 
 // ── POST /api/sends/{send_id}/access/file/{file_id} (anonymous file) ─
@@ -750,6 +839,7 @@ pub async fn access_send(
 #[worker::send]
 pub async fn access_file_send(
     State(env): State<Arc<Env>>,
+    headers: HeaderMap,
     Path((send_id, file_id)): Path<(String, String)>,
     Extension(BaseUrl(base_url)): Extension<BaseUrl>,
     Json(payload): Json<SendAccessRequest>,
@@ -766,6 +856,15 @@ pub async fn access_file_send(
     }
 
     if send.has_password() {
+        enforce_ip_rate_limit(
+            &env,
+            &headers,
+            "SEND_ACCESS_RATE_LIMITER",
+            "send-access",
+            "Too many send password attempts. Please try again later.",
+        )
+        .await?;
+
         let pw = payload
             .password
             .as_deref()
@@ -776,38 +875,23 @@ pub async fn access_file_send(
     }
 
     send.increment_access_count(&db).await?;
-    db::touch_user_updated_at(&db, &send.user_id, &send.updated_at).await?;
-
-    notifications::publish_send_update(
-        env.as_ref(),
-        &send.user_id,
-        UpdateType::SyncSendUpdate,
-        &send.id,
-        &send.updated_at,
-        None,
-    )
-    .await;
-
-    let token = build_download_token(&env, &send_id, &file_id)?;
-    let url = format!("{base_url}/api/sends/{send_id}/{file_id}?t={token}");
-
-    Ok(Json(serde_json::json!({
-        "id": file_id,
-        "url": url,
-        "object": "send-fileDownload",
-    })))
+    send_file_download_response(&env, &db, &send, &file_id, &base_url).await
 }
 
 // ── Key rotation support ────────────────────────────────────────────
 
 pub async fn rotate_user_sends(
-    db: &D1Database,
+    db: &crate::db::Db,
     _env: &Env,
     user_id: &str,
     sends: &[SendRequestData],
     now: &str,
     batch_size: usize,
 ) -> Result<(), AppError> {
+    for send_data in sends {
+        ensure_email_verification_is_not_requested(send_data)?;
+    }
+
     let db_sends = SendDB::find_by_user(db, user_id).await?;
 
     let db_ids: std::collections::HashSet<&str> = db_sends.iter().map(|s| s.id.as_str()).collect();
@@ -836,7 +920,7 @@ pub async fn rotate_user_sends(
             continue;
         };
 
-        let stmt = worker::query!(
+        let stmt = d1_query!(
             db,
             "UPDATE sends SET name = ?1, notes = ?2, data = ?3, akey = ?4, updated_at = ?5 WHERE id = ?6 AND user_id = ?7",
             send_data.name,
@@ -857,7 +941,11 @@ pub async fn rotate_user_sends(
 
 // ── Cleanup helpers ─────────────────────────────────────────────────
 
-pub async fn delete_user_sends(db: &D1Database, env: &Env, user_id: &str) -> Result<(), AppError> {
+pub async fn delete_user_sends(
+    db: &crate::db::Db,
+    env: &Env,
+    user_id: &str,
+) -> Result<(), AppError> {
     if attachments_enabled(env) {
         let keys = SendDB::storage_keys_by_user(db, user_id).await?;
         if !keys.is_empty() {
@@ -873,7 +961,7 @@ pub async fn delete_user_sends(db: &D1Database, env: &Env, user_id: &str) -> Res
 
 pub async fn append_sends_json_array(
     out: &mut String,
-    db: &D1Database,
+    db: &crate::db::Db,
     user_id: &str,
 ) -> Result<(), AppError> {
     let sends = SendDB::find_by_user(db, user_id).await?;

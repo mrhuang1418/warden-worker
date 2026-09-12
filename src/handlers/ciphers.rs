@@ -1,3 +1,4 @@
+use crate::d1_query;
 use axum::extract::Path;
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
@@ -8,7 +9,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
 use uuid::Uuid;
-use worker::{query, wasm_bindgen::JsValue, Env};
+use worker::{wasm_bindgen::JsValue, Env};
 
 use crate::auth::Claims;
 use crate::db;
@@ -33,7 +34,7 @@ impl IntoResponse for RawJson {
 
 /// Helper to fetch a cipher by id for a user or return NotFound.
 async fn fetch_cipher_for_user(
-    db: &worker::D1Database,
+    db: &crate::db::Db,
     cipher_id: &str,
     user_id: &str,
 ) -> Result<CipherDBModel, AppError> {
@@ -43,6 +44,32 @@ async fn fetch_cipher_for_user(
         .await
         .map_err(|_| AppError::Database)?
         .ok_or_else(|| AppError::NotFound("Cipher not found".to_string()))
+}
+
+/// Validates that an optional folder belongs to the user. An absent or empty folder ID clears
+/// the cipher's folder assignment and therefore requires no ownership check.
+async fn validate_folder_ownership(
+    db: &crate::db::Db,
+    folder_id: Option<&str>,
+    user_id: &str,
+) -> Result<(), AppError> {
+    let Some(folder_id) = folder_id.filter(|folder_id| !folder_id.is_empty()) else {
+        return Ok(());
+    };
+
+    let folder_exists: Option<Value> = db
+        .prepare("SELECT id FROM folders WHERE id = ?1 AND user_id = ?2")
+        .bind(&[folder_id.to_string().into(), user_id.to_string().into()])?
+        .first(None)
+        .await?;
+
+    if folder_exists.is_none() {
+        return Err(AppError::BadRequest(
+            "Invalid folder: Folder does not exist or belongs to another user".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 #[worker::send]
@@ -55,11 +82,13 @@ pub async fn create_cipher(
     let now = db::now_string();
     let cipher_data_req = payload.cipher;
 
-    let cipher_data = CipherData {
-        name: cipher_data_req.name,
-        notes: cipher_data_req.notes,
-        type_fields: cipher_data_req.type_fields,
-    };
+    validate_folder_ownership(&db, cipher_data_req.folder_id.as_deref(), &claims.sub).await?;
+
+    let cipher_data = CipherData::new(
+        cipher_data_req.name,
+        cipher_data_req.notes,
+        cipher_data_req.type_fields,
+    );
 
     let data_value = serde_json::to_value(&cipher_data).map_err(|_| AppError::Internal)?;
 
@@ -89,7 +118,7 @@ pub async fn create_cipher(
 
     let data = serde_json::to_string(&cipher.data).map_err(|_| AppError::Internal)?;
 
-    query!(
+    d1_query!(
         &db,
         "INSERT INTO ciphers (id, user_id, organization_id, type, data, favorite, folder_id, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -111,14 +140,13 @@ pub async fn create_cipher(
     db::touch_user_updated_at(&db, &claims.sub, &cipher.updated_at).await?;
 
     notifications::publish_cipher_update(
-        env.as_ref(),
-        &claims.sub,
+        (*env).clone(),
+        claims.sub,
         UpdateType::SyncCipherCreate,
-        &cipher.id,
-        &cipher.updated_at,
-        Some(&claims.device),
-    )
-    .await;
+        cipher.id.clone(),
+        cipher.updated_at.clone(),
+        Some(claims.device),
+    );
 
     Ok(Json(cipher))
 }
@@ -136,20 +164,7 @@ pub async fn update_cipher(
 
     let existing_cipher = fetch_cipher_for_user(&db, &id, &claims.sub).await?;
 
-    // Validate folder ownership if provided
-    if let Some(ref folder_id) = payload.folder_id {
-        let folder_exists: Option<serde_json::Value> = db
-            .prepare("SELECT id FROM folders WHERE id = ?1 AND user_id = ?2")
-            .bind(&[folder_id.clone().into(), claims.sub.clone().into()])?
-            .first(None)
-            .await?;
-
-        if folder_exists.is_none() {
-            return Err(AppError::BadRequest(
-                "Invalid folder: Folder does not exist or belongs to another user".to_string(),
-            ));
-        }
-    }
+    validate_folder_ownership(&db, payload.folder_id.as_deref(), &claims.sub).await?;
 
     // Reject updates based on stale client data when the last known revision is provided
     if let Some(dt) = payload.last_known_revision_date.as_deref() {
@@ -173,24 +188,18 @@ pub async fn update_cipher(
         }
     }
 
-    let cipher_data_req = payload;
-
-    let cipher_data = CipherData {
-        name: cipher_data_req.name,
-        notes: cipher_data_req.notes,
-        type_fields: cipher_data_req.type_fields,
-    };
+    let cipher_data = CipherData::new(payload.name, payload.notes, payload.type_fields);
 
     let data_value = serde_json::to_value(&cipher_data).map_err(|_| AppError::Internal)?;
 
     let mut cipher = Cipher {
         id: id.clone(),
         user_id: Some(claims.sub.clone()),
-        organization_id: cipher_data_req.organization_id.clone(),
-        r#type: cipher_data_req.r#type,
+        organization_id: payload.organization_id.clone(),
+        r#type: payload.r#type,
         data: data_value,
-        favorite: cipher_data_req.favorite.unwrap_or(false),
-        folder_id: cipher_data_req.folder_id.clone(),
+        favorite: payload.favorite.unwrap_or(false),
+        folder_id: payload.folder_id.clone(),
         deleted_at: None,
         archived_at: existing_cipher.archived_at,
         created_at: existing_cipher.created_at,
@@ -205,7 +214,7 @@ pub async fn update_cipher(
 
     let data = serde_json::to_string(&cipher.data).map_err(|_| AppError::Internal)?;
 
-    query!(
+    d1_query!(
         &db,
         "UPDATE ciphers SET organization_id = ?1, type = ?2, data = ?3, favorite = ?4, folder_id = ?5, updated_at = ?6 WHERE id = ?7 AND user_id = ?8",
         cipher.organization_id,
@@ -220,9 +229,9 @@ pub async fn update_cipher(
     .run()
     .await?;
 
-    if let Some(attachments2) = &cipher_data_req.attachments2 {
+    if let Some(attachments2) = &payload.attachments2 {
         for (attachment_id, attachment) in attachments2 {
-            let result = query!(
+            let result = d1_query!(
                 &db,
                 "UPDATE attachments SET file_name = ?1, akey = ?2, updated_at = ?3 WHERE id = ?4 AND cipher_id = ?5",
                 attachment.file_name,
@@ -238,7 +247,9 @@ pub async fn update_cipher(
             if let Err(e) = result {
                 log::warn!(
                     "Failed to update attachment {} for cipher {}: {:?}",
-                    attachment_id, id, e
+                    attachment_id,
+                    id,
+                    e
                 );
             }
         }
@@ -248,14 +259,13 @@ pub async fn update_cipher(
     db::touch_user_updated_at(&db, &claims.sub, &cipher.updated_at).await?;
 
     notifications::publish_cipher_update(
-        env.as_ref(),
-        &claims.sub,
+        (*env).clone(),
+        claims.sub,
         UpdateType::SyncCipherUpdate,
-        &cipher.id,
-        &cipher.updated_at,
-        Some(&claims.device),
-    )
-    .await;
+        cipher.id.clone(),
+        cipher.updated_at.clone(),
+        Some(claims.device),
+    );
 
     Ok(Json(cipher))
 }
@@ -314,27 +324,14 @@ pub async fn update_cipher_partial(
     let db = db::get_db(&env)?;
     let user_id = &claims.sub;
 
-    // Validate folder ownership if provided
-    if let Some(ref folder_id) = payload.folder_id {
-        let folder_exists: Option<serde_json::Value> = db
-            .prepare("SELECT id FROM folders WHERE id = ?1 AND user_id = ?2")
-            .bind(&[folder_id.clone().into(), user_id.clone().into()])?
-            .first(None)
-            .await?;
-
-        if folder_exists.is_none() {
-            return Err(AppError::BadRequest(
-                "Invalid folder: Folder does not exist or belongs to another user".to_string(),
-            ));
-        }
-    }
+    validate_folder_ownership(&db, payload.folder_id.as_deref(), user_id).await?;
 
     // Ensure cipher exists and belongs to user
     fetch_cipher_for_user(&db, &id, user_id).await?;
 
     let now = db::now_string();
 
-    query!(
+    d1_query!(
         &db,
         "UPDATE ciphers SET folder_id = ?1, favorite = ?2, updated_at = ?3 WHERE id = ?4 AND user_id = ?5",
         payload.folder_id,
@@ -370,7 +367,7 @@ pub async fn soft_delete_cipher(
     fetch_cipher_for_user(&db, &id, &claims.sub).await?;
     let now = db::now_string();
 
-    query!(
+    d1_query!(
         &db,
         "UPDATE ciphers SET deleted_at = ?1, updated_at = ?1 WHERE id = ?2 AND user_id = ?3",
         now,
@@ -384,14 +381,13 @@ pub async fn soft_delete_cipher(
     db::touch_user_updated_at(&db, &claims.sub, &now).await?;
 
     notifications::publish_cipher_update(
-        env.as_ref(),
-        &claims.sub,
+        (*env).clone(),
+        claims.sub,
         UpdateType::SyncCipherUpdate,
-        &id,
-        &now,
-        Some(&claims.device),
-    )
-    .await;
+        id,
+        now,
+        Some(claims.device),
+    );
 
     Ok(Json(()))
 }
@@ -408,7 +404,7 @@ pub async fn soft_delete_ciphers_bulk(
     let db = db::get_db(&env)?;
     let now = db::now_string();
 
-    query!(
+    d1_query!(
         &db,
         "UPDATE ciphers SET deleted_at = ?1, updated_at = ?1 WHERE user_id = ?2 AND id IN (SELECT value FROM json_each(?3, '$.ids'))",
         now,
@@ -423,13 +419,12 @@ pub async fn soft_delete_ciphers_bulk(
     db::touch_user_updated_at(&db, &claims.sub, &now).await?;
 
     notifications::publish_user_update(
-        env.as_ref(),
-        &claims.sub,
+        (*env).clone(),
+        claims.sub,
         UpdateType::SyncCiphers,
-        &now,
-        Some(&claims.device),
-    )
-    .await;
+        now,
+        Some(claims.device),
+    );
 
     Ok(Json(()))
 }
@@ -458,7 +453,7 @@ pub async fn hard_delete_cipher(
         attachments::delete_storage_objects(env.as_ref(), &keys).await?;
     }
 
-    query!(
+    d1_query!(
         &db,
         "DELETE FROM ciphers WHERE id = ?1 AND user_id = ?2",
         id,
@@ -471,14 +466,13 @@ pub async fn hard_delete_cipher(
     db::touch_user_updated_at(&db, &claims.sub, &now).await?;
 
     notifications::publish_cipher_update(
-        env.as_ref(),
-        &claims.sub,
+        (*env).clone(),
+        claims.sub,
         UpdateType::SyncLoginDelete,
-        &id,
-        &now,
-        Some(&claims.device),
-    )
-    .await;
+        id,
+        now,
+        Some(claims.device),
+    );
 
     Ok(Json(()))
 }
@@ -506,7 +500,7 @@ pub async fn hard_delete_ciphers_bulk(
         attachments::delete_storage_objects(env.as_ref(), &keys).await?;
     }
 
-    query!(
+    d1_query!(
         &db,
         "DELETE FROM ciphers WHERE user_id = ?1 AND id IN (SELECT value FROM json_each(?2, '$.ids'))",
         claims.sub,
@@ -520,13 +514,12 @@ pub async fn hard_delete_ciphers_bulk(
     db::touch_user_updated_at(&db, &claims.sub, &now).await?;
 
     notifications::publish_user_update(
-        env.as_ref(),
-        &claims.sub,
+        (*env).clone(),
+        claims.sub,
         UpdateType::SyncCiphers,
-        &now,
-        Some(&claims.device),
-    )
-    .await;
+        now,
+        Some(claims.device),
+    );
 
     Ok(Json(()))
 }
@@ -544,7 +537,7 @@ pub async fn restore_cipher(
     let now = db::now_string();
 
     // Update the cipher to clear deleted_at
-    query!(
+    d1_query!(
         &db,
         "UPDATE ciphers SET deleted_at = NULL, updated_at = ?1 WHERE id = ?2 AND user_id = ?3",
         now,
@@ -562,14 +555,13 @@ pub async fn restore_cipher(
     db::touch_user_updated_at(&db, &claims.sub, &cipher.updated_at).await?;
 
     notifications::publish_cipher_update(
-        env.as_ref(),
-        &claims.sub,
+        (*env).clone(),
+        claims.sub,
         UpdateType::SyncCipherUpdate,
-        &cipher.id,
-        &cipher.updated_at,
-        Some(&claims.device),
-    )
-    .await;
+        cipher.id.clone(),
+        cipher.updated_at.clone(),
+        Some(claims.device),
+    );
 
     Ok(Json(cipher))
 }
@@ -587,7 +579,7 @@ pub async fn restore_ciphers_bulk(
     let now = db::now_string();
 
     // Single bulk UPDATE using json_each() with path
-    query!(
+    d1_query!(
         &db,
         "UPDATE ciphers SET deleted_at = NULL, updated_at = ?1 WHERE user_id = ?2 AND id IN (SELECT value FROM json_each(?3, '$.ids'))",
         now,
@@ -602,19 +594,18 @@ pub async fn restore_ciphers_bulk(
     db::touch_user_updated_at(&db, &claims.sub, &now).await?;
 
     notifications::publish_user_update(
-        env.as_ref(),
-        &claims.sub,
+        (*env).clone(),
+        claims.sub.clone(),
         UpdateType::SyncCiphers,
-        &now,
-        Some(&claims.device),
-    )
-    .await;
+        now,
+        Some(claims.device),
+    );
 
     build_cipher_list_response(
         &db,
         env.as_ref(),
         "WHERE c.user_id = ?1 AND c.id IN (SELECT value FROM json_each(?2, '$.ids'))",
-        &[claims.sub.clone().into(), body.clone().into()],
+        &[claims.sub.into(), body.into()],
         "",
     )
     .await
@@ -635,7 +626,7 @@ pub async fn archive_cipher(
     })?;
     let now = db::now_string();
 
-    query!(
+    d1_query!(
         &db,
         "UPDATE ciphers SET archived_at = ?1, updated_at = ?1 WHERE id = ?2 AND user_id = ?3",
         now,
@@ -653,14 +644,13 @@ pub async fn archive_cipher(
     db::touch_user_updated_at(&db, &claims.sub, &cipher.updated_at).await?;
 
     notifications::publish_cipher_update(
-        env.as_ref(),
-        &claims.sub,
+        (*env).clone(),
+        claims.sub,
         UpdateType::SyncCipherUpdate,
-        &cipher.id,
-        &cipher.updated_at,
-        Some(&claims.device),
-    )
-    .await;
+        cipher.id.clone(),
+        cipher.updated_at.clone(),
+        Some(claims.device),
+    );
 
     Ok(Json(cipher))
 }
@@ -680,7 +670,7 @@ pub async fn unarchive_cipher(
     })?;
     let now = db::now_string();
 
-    query!(
+    d1_query!(
         &db,
         "UPDATE ciphers SET archived_at = NULL, updated_at = ?1 WHERE id = ?2 AND user_id = ?3",
         now,
@@ -698,14 +688,13 @@ pub async fn unarchive_cipher(
     db::touch_user_updated_at(&db, &claims.sub, &cipher.updated_at).await?;
 
     notifications::publish_cipher_update(
-        env.as_ref(),
-        &claims.sub,
+        (*env).clone(),
+        claims.sub,
         UpdateType::SyncCipherUpdate,
-        &cipher.id,
-        &cipher.updated_at,
-        Some(&claims.device),
-    )
-    .await;
+        cipher.id.clone(),
+        cipher.updated_at.clone(),
+        Some(claims.device),
+    );
 
     Ok(Json(cipher))
 }
@@ -721,7 +710,7 @@ pub async fn archive_ciphers_bulk(
     let db = db::get_db(&env)?;
     let now = db::now_string();
 
-    query!(
+    d1_query!(
         &db,
         "UPDATE ciphers SET archived_at = ?1, updated_at = ?1 WHERE user_id = ?2 AND id IN (SELECT value FROM json_each(?3, '$.ids'))",
         now,
@@ -736,19 +725,18 @@ pub async fn archive_ciphers_bulk(
     db::touch_user_updated_at(&db, &claims.sub, &now).await?;
 
     notifications::publish_user_update(
-        env.as_ref(),
-        &claims.sub,
+        (*env).clone(),
+        claims.sub.clone(),
         UpdateType::SyncCiphers,
-        &now,
-        Some(&claims.device),
-    )
-    .await;
+        now,
+        Some(claims.device),
+    );
 
     build_cipher_list_response(
         &db,
         env.as_ref(),
         "WHERE c.user_id = ?1 AND c.id IN (SELECT value FROM json_each(?2, '$.ids'))",
-        &[claims.sub.clone().into(), body.clone().into()],
+        &[claims.sub.into(), body.into()],
         "",
     )
     .await
@@ -765,7 +753,7 @@ pub async fn unarchive_ciphers_bulk(
     let db = db::get_db(&env)?;
     let now = db::now_string();
 
-    query!(
+    d1_query!(
         &db,
         "UPDATE ciphers SET archived_at = NULL, updated_at = ?1 WHERE user_id = ?2 AND id IN (SELECT value FROM json_each(?3, '$.ids'))",
         now,
@@ -780,19 +768,18 @@ pub async fn unarchive_ciphers_bulk(
     db::touch_user_updated_at(&db, &claims.sub, &now).await?;
 
     notifications::publish_user_update(
-        env.as_ref(),
-        &claims.sub,
+        (*env).clone(),
+        claims.sub.clone(),
         UpdateType::SyncCiphers,
-        &now,
-        Some(&claims.device),
-    )
-    .await;
+        now,
+        Some(claims.device),
+    );
 
     build_cipher_list_response(
         &db,
         env.as_ref(),
         "WHERE c.user_id = ?1 AND c.id IN (SELECT value FROM json_each(?2, '$.ids'))",
-        &[claims.sub.clone().into(), body.clone().into()],
+        &[claims.sub.into(), body.into()],
         "",
     )
     .await
@@ -809,11 +796,10 @@ pub async fn create_cipher_simple(
 ) -> Result<Json<Cipher>, AppError> {
     let db = db::get_db(&env)?;
     let now = db::now_string();
-    let cipher_data = CipherData {
-        name: payload.name,
-        notes: payload.notes,
-        type_fields: payload.type_fields,
-    };
+
+    validate_folder_ownership(&db, payload.folder_id.as_deref(), &claims.sub).await?;
+
+    let cipher_data = CipherData::new(payload.name, payload.notes, payload.type_fields);
 
     let data_value = serde_json::to_value(&cipher_data).map_err(|_| AppError::Internal)?;
 
@@ -839,7 +825,7 @@ pub async fn create_cipher_simple(
 
     let data = serde_json::to_string(&cipher.data).map_err(|_| AppError::Internal)?;
 
-    query!(
+    d1_query!(
         &db,
         "INSERT INTO ciphers (id, user_id, organization_id, type, data, favorite, folder_id, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -860,14 +846,13 @@ pub async fn create_cipher_simple(
     db::touch_user_updated_at(&db, &claims.sub, &cipher.updated_at).await?;
 
     notifications::publish_cipher_update(
-        env.as_ref(),
-        &claims.sub,
+        (*env).clone(),
+        claims.sub,
         UpdateType::SyncCipherCreate,
-        &cipher.id,
-        &cipher.updated_at,
-        Some(&claims.device),
-    )
-    .await;
+        cipher.id.clone(),
+        cipher.updated_at.clone(),
+        Some(claims.device),
+    );
 
     Ok(Json(cipher))
 }
@@ -921,13 +906,12 @@ pub async fn move_cipher_selected(
     // Update user's revision date
     db::touch_user_updated_at(&db, user_id, &now).await?;
     notifications::publish_user_update(
-        env.as_ref(),
-        user_id,
+        (*env).clone(),
+        claims.sub,
         UpdateType::SyncCiphers,
-        &now,
-        Some(&claims.device),
-    )
-    .await;
+        now,
+        Some(claims.device),
+    );
 
     Ok(Json(()))
 }
@@ -974,13 +958,13 @@ pub async fn purge_vault(
     }
 
     // Delete all user's ciphers (both active and soft-deleted)
-    query!(&db, "DELETE FROM ciphers WHERE user_id = ?1", user_id)
+    d1_query!(&db, "DELETE FROM ciphers WHERE user_id = ?1", user_id)
         .map_err(|_| AppError::Database)?
         .run()
         .await?;
 
     // Delete all user's folders
-    query!(&db, "DELETE FROM folders WHERE user_id = ?1", user_id)
+    d1_query!(&db, "DELETE FROM folders WHERE user_id = ?1", user_id)
         .map_err(|_| AppError::Database)?
         .run()
         .await?;
@@ -990,13 +974,12 @@ pub async fn purge_vault(
     db::touch_user_updated_at(&db, user_id, &now).await?;
 
     notifications::publish_user_update(
-        env.as_ref(),
-        user_id,
+        (*env).clone(),
+        claims.sub,
         UpdateType::SyncVault,
-        &now,
-        Some(&claims.device),
-    )
-    .await;
+        now,
+        Some(claims.device),
+    );
 
     Ok(Json(()))
 }
@@ -1066,6 +1049,9 @@ fn cipher_json_expr(attachments_enabled: bool) -> String {
             'card', CASE WHEN c.type = 3 THEN json_extract(c.data, '$.card') ELSE NULL END,
             'identity', CASE WHEN c.type = 4 THEN json_extract(c.data, '$.identity') ELSE NULL END,
             'sshKey', CASE WHEN c.type = 5 THEN json_extract(c.data, '$.sshKey') ELSE NULL END,
+            'bankAccount', CASE WHEN c.type = 6 THEN json_extract(c.data, '$.bankAccount') ELSE NULL END,
+            'driversLicense', CASE WHEN c.type = 7 THEN json_extract(c.data, '$.driversLicense') ELSE NULL END,
+            'passport', CASE WHEN c.type = 8 THEN json_extract(c.data, '$.passport') ELSE NULL END,
             'key', json_extract(c.data, '$.key')
         )",
         attachments_expr = attachments_expr,
@@ -1119,7 +1105,7 @@ fn is_sqlite_toobig(err: &worker::Error) -> bool {
 /// Build a `{"data":[...],"object":"list","continuationToken":null}` response
 /// using raw SQL JSON construction (no Rust-side parsing).
 async fn build_cipher_list_response(
-    db: &worker::D1Database,
+    db: &crate::db::Db,
     env: &Env,
     where_clause: &str,
     params: &[JsValue],
@@ -1147,7 +1133,7 @@ async fn build_cipher_list_response(
 /// This avoids JSON parsing in Rust, significantly reducing CPU time.
 pub(crate) async fn append_cipher_json_array_raw(
     out: &mut String,
-    db: &worker::D1Database,
+    db: &crate::db::Db,
     attachments_enabled: bool,
     where_clause: &str,
     params: &[JsValue],
@@ -1204,7 +1190,7 @@ pub(crate) async fn append_cipher_json_array_raw(
 /// where the first element is the JSON string we need.
 pub(crate) async fn append_from_rows(
     out: &mut String,
-    db: &worker::D1Database,
+    db: &crate::db::Db,
     attachments_enabled: bool,
     where_clause: &str,
     params: &[JsValue],

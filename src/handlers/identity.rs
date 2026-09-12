@@ -1,4 +1,9 @@
-use axum::{extract::State, Form, Json};
+use axum::{
+    extract::State,
+    http::HeaderMap,
+    response::{IntoResponse, Response},
+    Form, Json,
+};
 use chrono::{Duration, Utc};
 use constant_time_eq::constant_time_eq;
 use jwt_compact::AlgorithmExt;
@@ -6,19 +11,28 @@ use jwt_compact::{alg::Hs256Key, Claims as JwtClaims, Header, UntrustedToken};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
-use worker::{query, Env};
+use std::time::Duration as StdDuration;
+use worker::{Delay, Env};
 
+use crate::d1_query;
 use crate::{
-    auth::{jwt_time_options, Claims},
+    auth::{
+        jwt_time_options,
+        send::{create_send_access_token, SEND_ACCESS_TOKEN_TTL_SECS},
+        Claims,
+    },
+    client_context::{parse_required_device_type, request_ip_from_headers},
     crypto::{ct_eq, generate_salt, hash_password_for_storage, validate_totp},
     db,
     error::AppError,
     handlers::{
-        allow_totp_drift, server_password_iterations,
+        allow_totp_drift, enforce_ip_rate_limit, enforce_rate_limit, server_password_iterations,
         twofactor::{is_twofactor_enabled, list_user_twofactors},
     },
     models::{
+        auth_request::AuthRequest,
         device::{Device, DeviceType},
+        send::{SendAccessTokenResponse, SendDB},
         twofactor::{TwoFactor, TwoFactorType},
         user::User,
     },
@@ -27,6 +41,24 @@ use crate::{
 
 const PASSWORD_SCOPE: &str = "api offline_access";
 const REMEMBER_TOKEN_ISSUER: &str = "warden-worker-device-remember";
+
+fn login_missing_user_delay_ms(env: &Env) -> u64 {
+    const JITTER_MS: i32 = 30;
+    const DEFAULT_LOGIN_MISSING_USER_DELAY_MS: i32 = 550;
+    let base_ms = env
+        .var("LOGIN_MISSING_USER_DELAY_MS")
+        .ok()
+        .and_then(|value| value.to_string().parse::<i32>().ok())
+        .unwrap_or(DEFAULT_LOGIN_MISSING_USER_DELAY_MS);
+
+    let mut random_byte = [0u8; 1];
+    let jitter_ms = if getrandom::fill(&mut random_byte).is_ok() {
+        (i32::from(random_byte[0]) * (JITTER_MS * 2 + 1) / 256) - JITTER_MS
+    } else {
+        0
+    };
+    (base_ms + jitter_ms).max(0) as u64
+}
 
 /// Deserialize an Option<i32> that may have trailing/leading whitespace.
 /// This handles Android clients that send "0 " instead of "0".
@@ -56,11 +88,15 @@ where
 pub struct TokenRequest {
     grant_type: String,
     username: Option<String>,
-    password: Option<String>, // This is the masterPasswordHash
+    password: Option<String>, // masterPasswordHash or auth request access code
     refresh_token: Option<String>,
     #[serde(rename = "client_id", alias = "clientId")]
     client_id: Option<String>,
+    send_id: Option<String>,
+    password_hash_b64: Option<String>,
     scope: Option<String>,
+    #[serde(rename = "authrequest", alias = "authRequest")]
+    auth_request: Option<String>,
     // 2FA fields
     #[serde(rename = "twoFactorToken")]
     two_factor_token: Option<String>,
@@ -90,6 +126,14 @@ struct DeviceAuthRequest {
     identifier: String,
     name: String,
     r#type: i32,
+}
+
+#[derive(Debug)]
+struct PasswordGrantAuthContext {
+    user: User,
+    device_request: DeviceAuthRequest,
+    password_hash: Option<String>,
+    needs_migration: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -203,28 +247,117 @@ fn parse_password_device_request(payload: &TokenRequest) -> Result<DeviceAuthReq
         client_id: required_field(payload.client_id.as_deref(), "client_id")?,
         identifier: required_field(payload.device_identifier.as_deref(), "device_identifier")?,
         name: required_field(payload.device_name.as_deref(), "device_name")?,
-        r#type: DeviceType::from_str(&required_field(
-            payload.device_type.as_deref(),
-            "device_type",
-        )?)
-        .as_i32(),
+        r#type: parse_required_device_type(payload.device_type.as_deref(), "device_type")?,
     })
 }
 
-async fn load_user_by_email(db: &worker::D1Database, email: &str) -> Result<User, AppError> {
-    let user_value: Option<Value> = db
-        .prepare("SELECT * FROM users WHERE email = ?1")
-        .bind(&[email.to_lowercase().into()])?
-        .first(None)
-        .await
-        .map_err(|_| AppError::Database)?;
+async fn generate_send_access_token_response(
+    env: &Env,
+    db: &crate::db::Db,
+    headers: &HeaderMap,
+    payload: &TokenRequest,
+) -> Result<Json<SendAccessTokenResponse>, AppError> {
+    let _client_id = required_field(payload.client_id.as_deref(), "client_id")?;
+    let access_id = required_field(payload.send_id.as_deref(), "send_id")?;
+    let mut send = SendDB::find_by_access_id(db, &access_id)
+        .await?
+        .ok_or_else(AppError::send_access_invalid)?;
 
-    let user_value =
-        user_value.ok_or_else(|| AppError::Unauthorized("Invalid credentials".to_string()))?;
-    serde_json::from_value(user_value).map_err(|_| AppError::Internal)
+    if send.validate_access().is_err() {
+        return Err(AppError::send_access_invalid());
+    }
+
+    if send.has_password() {
+        enforce_ip_rate_limit(
+            env,
+            headers,
+            "SEND_ACCESS_RATE_LIMITER",
+            "send-access",
+            "Too many send password attempts. Please try again later.",
+        )
+        .await?;
+
+        let password_hash_b64 =
+            required_field(payload.password_hash_b64.as_deref(), "password_hash_b64")
+                .map_err(|_| AppError::send_access_password_required())?;
+        if !send.check_password(&password_hash_b64).await? {
+            return Err(AppError::send_access_password_invalid());
+        }
+    }
+
+    send.increment_access_count(db).await?;
+    let access_token = create_send_access_token(env, &send.id)?;
+
+    Ok(Json(SendAccessTokenResponse {
+        access_token,
+        expires_in: SEND_ACCESS_TOKEN_TTL_SECS,
+        token_type: "Bearer".to_string(),
+        scope: "api.send.access".to_string(),
+    }))
 }
 
-async fn load_user_by_id(db: &worker::D1Database, user_id: &str) -> Result<User, AppError> {
+async fn authenticate_password_grant(
+    env: &Env,
+    db: &crate::db::Db,
+    headers: &HeaderMap,
+    payload: &TokenRequest,
+    username: &str,
+) -> Result<PasswordGrantAuthContext, AppError> {
+    let password_hash = required_field(payload.password.as_deref(), "password")?;
+    let device_request = parse_password_device_request(payload)?;
+    let user = match User::find_by_email(db, &username.to_lowercase()).await? {
+        Some(user) => user,
+        None => {
+            Delay::from(StdDuration::from_millis(login_missing_user_delay_ms(env))).await;
+            return Err(AppError::Unauthorized("Invalid credentials".to_string()));
+        }
+    };
+
+    // Bitwarden "login with device" flow:
+    // When `authrequest` is present, clients send the auth-request access code in the `password`
+    // field. In that case we do NOT verify the user's master password (or run KDF migration);
+    // we only validate the auth request (approval, expiry, IP/device match, access code).
+    if let Some(auth_request_id) = optional_field(payload.auth_request.as_deref()) {
+        let auth_request = AuthRequest::find_by_id_and_user(db, &auth_request_id, &user.id)
+            .await?
+            .ok_or_else(|| {
+                AppError::BadRequest("Auth request not found. Try again.".to_string())
+            })?;
+
+        if !auth_request.is_approved()
+            || auth_request.is_expired()
+            || auth_request.request_ip != request_ip_from_headers(headers)
+            || auth_request.request_device_identifier != device_request.identifier
+            || auth_request.device_type != device_request.r#type
+            || !auth_request.check_access_code(&password_hash)
+        {
+            return Err(AppError::BadRequest(
+                "Username or access code is incorrect. Try again".to_string(),
+            ));
+        }
+
+        return Ok(PasswordGrantAuthContext {
+            user,
+            device_request,
+            password_hash: None,
+            needs_migration: false,
+        });
+    }
+
+    let verification = user.verify_master_password(&password_hash).await?;
+    if !verification.is_valid() {
+        return Err(AppError::Unauthorized("Invalid credentials".to_string()));
+    }
+
+    Ok(PasswordGrantAuthContext {
+        user,
+        device_request,
+        password_hash: Some(password_hash),
+        needs_migration: verification.needs_migration(),
+    })
+}
+
+async fn load_user_by_id(db: &crate::db::Db, user_id: &str) -> Result<User, AppError> {
     let user_value: Option<Value> = db
         .prepare("SELECT * FROM users WHERE id = ?1")
         .bind(&[user_id.into()])?
@@ -237,7 +370,7 @@ async fn load_user_by_id(db: &worker::D1Database, user_id: &str) -> Result<User,
 }
 
 async fn maybe_upgrade_password_hash(
-    db: &worker::D1Database,
+    db: &crate::db::Db,
     env: &Env,
     user: User,
     password_hash: &str,
@@ -255,7 +388,7 @@ async fn maybe_upgrade_password_hash(
         hash_password_for_storage(password_hash, &new_salt, desired_iterations as u32).await?;
     let now = db::now_string();
 
-    query!(
+    d1_query!(
         db,
         "UPDATE users SET master_password_hash = ?1, password_salt = ?2, password_iterations = ?3, updated_at = ?4 WHERE id = ?5",
         &new_hash,
@@ -448,33 +581,38 @@ fn generate_tokens_and_response(
 #[worker::send]
 pub async fn token(
     State(env): State<Arc<Env>>,
+    headers: HeaderMap,
     Form(payload): Form<TokenRequest>,
-) -> Result<Json<TokenResponse>, AppError> {
+) -> Result<Response, AppError> {
     let db = db::get_db(&env)?;
 
     match payload.grant_type.as_str() {
         "password" => {
             let username = required_field(payload.username.as_deref(), "username")?;
-            let password_hash = required_field(payload.password.as_deref(), "password")?;
-            let device_request = parse_password_device_request(&payload)?;
 
-            // Check rate limit using email as key to prevent brute force attacks.
-            if let Ok(rate_limiter) = env.rate_limiter("LOGIN_RATE_LIMITER") {
-                let rate_limit_key = format!("login:{}", username.to_lowercase());
-                if let Ok(outcome) = rate_limiter.limit(rate_limit_key).await {
-                    if !outcome.success {
-                        return Err(AppError::TooManyRequests(
-                            "Too many login attempts. Please try again later.".to_string(),
-                        ));
-                    }
-                }
-            }
+            enforce_rate_limit(
+                env.as_ref(),
+                "LOGIN_RATE_LIMITER",
+                format!("login:{}", username.to_lowercase()),
+                "Too many login attempts. Please try again later.",
+            )
+            .await?;
+            enforce_ip_rate_limit(
+                env.as_ref(),
+                &headers,
+                "LOGIN_RATE_LIMITER",
+                "login-ip",
+                "Too many login attempts. Please try again later.",
+            )
+            .await?;
 
-            let user = load_user_by_email(&db, &username).await?;
-            let verification = user.verify_master_password(&password_hash).await?;
-            if !verification.is_valid() {
-                return Err(AppError::Unauthorized("Invalid credentials".to_string()));
-            }
+            let PasswordGrantAuthContext {
+                user,
+                device_request,
+                password_hash,
+                needs_migration,
+            } = authenticate_password_grant(env.as_ref(), &db, &headers, &payload, &username)
+                .await?;
 
             let mut device = Device::get_or_create(
                 &db,
@@ -511,7 +649,7 @@ pub async fn token(
                             validate_totp(twofactor_code, &tf.data, tf.last_used, allow_drift)
                                 .await?;
 
-                        query!(
+                        d1_query!(
                             &db,
                             "UPDATE twofactor SET last_used = ?1 WHERE uuid = ?2",
                             new_last_used,
@@ -542,12 +680,12 @@ pub async fn token(
                                 ));
                             }
 
-                            query!(&db, "DELETE FROM twofactor WHERE user_uuid = ?1", &user.id)
+                            d1_query!(&db, "DELETE FROM twofactor WHERE user_uuid = ?1", &user.id)
                                 .map_err(|_| AppError::Database)?
                                 .run()
                                 .await
                                 .map_err(|_| AppError::Database)?;
-                            query!(
+                            d1_query!(
                                 &db,
                                 "UPDATE users SET totp_recover = NULL WHERE id = ?1",
                                 &user.id
@@ -556,7 +694,7 @@ pub async fn token(
                             .run()
                             .await
                             .map_err(|_| AppError::Database)?;
-                            query!(
+                            d1_query!(
                                 &db,
                                 "UPDATE devices SET twofactor_remember = NULL WHERE user_id = ?1",
                                 &user.id
@@ -579,14 +717,18 @@ pub async fn token(
                 }
             }
 
-            let user = maybe_upgrade_password_hash(
-                &db,
-                env.as_ref(),
-                user,
-                &password_hash,
-                verification.needs_migration(),
-            )
-            .await?;
+            let user = if let Some(password_hash) = password_hash {
+                maybe_upgrade_password_hash(
+                    &db,
+                    env.as_ref(),
+                    user,
+                    &password_hash,
+                    needs_migration,
+                )
+                .await?
+            } else {
+                user
+            };
             let mut two_factor_remember_token = None;
             if should_issue_remember {
                 let remember_token = generate_remember_token(env.as_ref(), &user, &device)?;
@@ -622,6 +764,7 @@ pub async fn token(
                 &env,
                 two_factor_remember_token,
             )
+            .map(IntoResponse::into_response)
         }
         "refresh_token" => {
             // When a refresh token is invalid or missing we need to respond with an HTTP BadRequest (400)
@@ -669,7 +812,11 @@ pub async fn token(
             let client_id = optional_field(payload.client_id.as_deref())
                 .unwrap_or_else(|| "undefined".to_string());
             generate_tokens_and_response(user, &device, &client_id, &env, None)
+                .map(IntoResponse::into_response)
         }
+        "send_access" => generate_send_access_token_response(env.as_ref(), &db, &headers, &payload)
+            .await
+            .map(IntoResponse::into_response),
         _ => Err(AppError::BadRequest("Unsupported grant_type".to_string())),
     }
 }
